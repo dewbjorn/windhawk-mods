@@ -25,9 +25,6 @@ window, if enabled) to slide it back up.
   configurable.
 - Optional: hide from taskbar, hide title bar, auto-hide on focus loss.
 
-<img width="1898" height="963" alt="650753110-8f5565e8-d20e-4245-8692-b49d23be35fa" src="https://github.com/user-attachments/assets/9dc9e740-5054-449e-9064-14cdaaaf5e14" />
-
-
 ## Installing
 
 1. Install [Windhawk](https://windhawk.net/).
