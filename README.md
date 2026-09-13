@@ -25,6 +25,8 @@ window, if enabled) to slide it back up.
   configurable.
 - Optional: hide from taskbar, hide title bar, auto-hide on focus loss.
 
+<img width="1898" height="963" alt="quake-mode" src="quake-mode.gif" />
+
 ## Installing
 
 1. Install [Windhawk](https://windhawk.net/).
