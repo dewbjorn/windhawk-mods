@@ -58,6 +58,10 @@ slide it back up out of view.
   $description: >-
     Slide the window back out of view when another window gets focus,
     not just when the hotkey is pressed again.
+- alwaysOnTop: true
+  $name: Always on top
+  $description: >-
+    Keep the docked window above other windows while it's visible.
 */
 // ==/WindhawkModSettings==
 
@@ -77,6 +81,7 @@ static UINT g_hotkeyVk = VK_OEM_3;
 static bool g_hideFromTaskbar = false;
 static bool g_hideTitleBar = false;
 static bool g_autoHideOnFocusLoss = true;
+static bool g_alwaysOnTop = true;
 static LONG_PTR g_originalExStyle = 0;
 static LONG_PTR g_originalStyle = 0;
 static bool g_styleModified = false;
@@ -94,6 +99,9 @@ static HWND g_previousForegroundHwnd = nullptr;
 static constexpr int kHotkeyId = 1;
 static constexpr int kAnimationDurationMs = 120;
 static constexpr int kAnimationFrameMs = 10;
+static constexpr ULONGLONG kHotkeyRepeatSuppressMs = 150;
+static constexpr UINT_PTR kTopmostTimerId = 2;
+static constexpr UINT kTopmostReassertIntervalMs = 200;
 
 static double EaseInOut(double t)
 {
@@ -228,6 +236,7 @@ static void LoadSettings()
     g_hideFromTaskbar = Wh_GetIntSetting(L"hideFromTaskbar") != 0;
     g_hideTitleBar = Wh_GetIntSetting(L"hideTitleBar") != 0;
     g_autoHideOnFocusLoss = Wh_GetIntSetting(L"autoHideOnFocusLoss") != 0;
+    g_alwaysOnTop = Wh_GetIntSetting(L"alwaysOnTop") != 0;
 }
 
 // ---- Window/monitor lookup ----
@@ -460,6 +469,14 @@ static void HideTargetWindow(bool restoreFocus)
         ForceSetForegroundWindow(g_previousForegroundHwnd);
     }
     g_previousForegroundHwnd = nullptr;
+
+    // Drop topmost only once the window is fully parked off-screen and
+    // focus has been handed back, so it doesn't lose its always-on-top
+    // standing while still visible mid-slide.
+    if (g_alwaysOnTop) {
+        SetWindowPos(g_targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 static void ShowTargetWindow(HWND hwnd)
@@ -472,7 +489,7 @@ static void ShowTargetWindow(HWND hwnd)
 
     SetWindowPos(
         hwnd,
-        HWND_TOP,
+        g_alwaysOnTop ? HWND_TOPMOST : HWND_TOP,
         hidden.left,
         hidden.top,
         hidden.right - hidden.left,
@@ -485,6 +502,14 @@ static void ShowTargetWindow(HWND hwnd)
 
     AnimateWindowToRect(hwnd, hidden, docked, kAnimationDurationMs);
 
+    // Reassert topmost as the final step: ForceSetForegroundWindow's
+    // BringWindowToTop/SetForegroundWindow calls can shuffle the window
+    // back under other topmost windows (e.g. the taskbar) before this.
+    if (g_alwaysOnTop) {
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
     g_visible = true;
 }
 
@@ -496,7 +521,12 @@ static void ToggleTargetWindow()
     }
 
     if (g_visible.load()) {
-        HideTargetWindow(/* restoreFocus */ true);
+        HWND foreground = GetForegroundWindow();
+        if (foreground && GetAncestor(foreground, GA_ROOT) == hwnd) {
+            HideTargetWindow(/* restoreFocus */ true);
+        } else {
+            ForceSetForegroundWindow(hwnd);
+        }
     } else {
         ShowTargetWindow(hwnd);
     }
@@ -509,7 +539,7 @@ static void CALLBACK OnForegroundChanged(
         return;
     }
 
-    if (!g_autoHideOnFocusLoss || !g_visible.load() || !g_targetHwnd) {
+    if (!g_visible.load() || !g_targetHwnd) {
         return;
     }
 
@@ -518,7 +548,19 @@ static void CALLBACK OnForegroundChanged(
         return;
     }
 
-    HideTargetWindow(/* restoreFocus */ false);
+    if (g_autoHideOnFocusLoss) {
+        HideTargetWindow(/* restoreFocus */ false);
+        return;
+    }
+
+    // Auto-hide is off, so the window stays parked and visible while
+    // another app takes focus. A newly focused window still gets raised
+    // above non-topmost windows, so re-pin ours above it on every focus
+    // change instead of relying on the one-time topmost flag from show.
+    if (g_alwaysOnTop) {
+        SetWindowPos(g_targetHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 static void HotkeyThreadProc()
@@ -547,12 +589,33 @@ static void HotkeyThreadProc()
         return;
     }
 
+    SetTimer(nullptr, kTopmostTimerId, kTopmostReassertIntervalMs, nullptr);
+
     MSG msg;
+    ULONGLONG lastHotkeyTick = 0;
     while (g_running.load() && GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyId) {
-            ToggleTargetWindow();
+        if (msg.message == WM_TIMER && msg.wParam == kTopmostTimerId) {
+            // Belt-and-suspenders for always-on-top: the foreground-change
+            // hook can miss windows (e.g. elevated processes a non-elevated
+            // hook can't see), so poll instead of relying on it alone.
+            if (g_alwaysOnTop && g_visible.load() && g_targetHwnd && IsWindow(g_targetHwnd)) {
+                SetWindowPos(g_targetHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        } else if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyId) {
+            // Windows re-sends WM_HOTKEY at the keyboard repeat rate while
+            // the key is held, which would otherwise toggle twice from a
+            // single press. Ignore repeats that land within the OS's own
+            // key-repeat delay of the last one we acted on.
+            ULONGLONG now = GetTickCount64();
+            if (now - lastHotkeyTick >= kHotkeyRepeatSuppressMs) {
+                lastHotkeyTick = now;
+                ToggleTargetWindow();
+            }
         }
     }
+
+    KillTimer(nullptr, kTopmostTimerId);
 
     if (g_foregroundHook) {
         UnhookWinEvent(g_foregroundHook);
